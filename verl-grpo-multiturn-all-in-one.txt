@@ -1,0 +1,497 @@
+VERL GRPO MULTI-TURN TOOL-CALLING TEMPLATE
+===========================================
+
+NOTE
+----
+This is a best-effort end-to-end template for VERL GRPO with multi-turn tool calling.
+It is written against the public VERL docs/repo state available on 2026-03-25.
+You will likely need small path/import adjustments depending on the exact VERL version
+you install, especially around alpha / recently added multi-turn APIs.
+
+This file includes multiple logical files in one text document.
+
+--------------------------------------------------------------------------------
+FILE: README.txt
+--------------------------------------------------------------------------------
+Project goal:
+- Use VERL with GRPO (`algorithm.adv_estimator=grpo`)
+- Enable multi-turn rollout
+- Let the model call tools during rollout
+- Score the whole trajectory with a custom reward function
+
+Why this layout:
+- VERL expects RL data in parquet format
+- VERL supports custom reward functions from an external Python file
+- Multi-turn rollout is enabled from rollout config, with tool definitions supplied by YAML
+- For custom tools, VERL docs point to `verl.tools.base_tool.BaseTool`
+
+Suggested layout:
+.
+├── data/
+│   ├── prepare_multiturn_dataset.py
+│   ├── train.parquet
+│   └── val.parquet
+├── reward/
+│   └── custom_reward.py
+├── tools/
+│   ├── simple_tools.py
+│   └── tools.yaml
+└── train_grpo_multiturn.sh
+
+Training pattern:
+1. Start from an SFT model that already knows the tool-calling format.
+2. Run GRPO on top of that model.
+3. Use a reward that checks both:
+   - final answer correctness
+   - tool usage quality
+
+--------------------------------------------------------------------------------
+FILE: data/prepare_multiturn_dataset.py
+--------------------------------------------------------------------------------
+import json
+import os
+from typing import Any, Dict, List
+
+import pandas as pd
+
+
+SYSTEM_PROMPT = """You are a helpful assistant.
+You may call tools when needed.
+Rules:
+1. Think step by step.
+2. If a tool is needed, call the appropriate tool with valid JSON arguments.
+3. You may call multiple tools over multiple turns if needed.
+4. After receiving tool results, produce a final answer.
+5. End your final answer with a line starting with 'FINAL:'.
+"""
+
+SAMPLES: List[Dict[str, Any]] = [
+    {
+        "id": "weather_seoul_tomorrow",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "내일 서울 날씨를 확인한 뒤 한 줄로 요약해줘."}
+        ],
+        "ground_truth": {
+            "final_answer_must_contain": ["서울", "맑음"],
+            "expected_tools": ["get_weather"],
+            "must_end_with_final": True
+        },
+        "extra_info": {
+            "split": "train",
+            "ability": "tool_calling",
+            "question": "내일 서울 날씨를 확인한 뒤 한 줄로 요약해줘."
+        }
+    },
+    {
+        "id": "weather_compare_multiturn",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "내일 서울과 부산의 날씨를 각각 확인하고, 어느 쪽이 더 따뜻한지 말해줘."}
+        ],
+        "ground_truth": {
+            "final_answer_must_contain": ["서울", "부산"],
+            "expected_tools": ["get_weather", "get_weather"],
+            "must_end_with_final": True
+        },
+        "extra_info": {
+            "split": "train",
+            "ability": "multi_turn_tool_calling",
+            "question": "내일 서울과 부산의 날씨를 각각 확인하고, 어느 쪽이 더 따뜻한지 말해줘."
+        }
+    },
+    {
+        "id": "calc_interest",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "2억 4천만 원을 연 4.1% 금리로 계산했을 때 월 이자만 얼마인지 계산해줘."}
+        ],
+        "ground_truth": {
+            "final_answer_must_contain": ["820000"],
+            "expected_tools": ["calculate_expression"],
+            "must_end_with_final": True
+        },
+        "extra_info": {
+            "split": "train",
+            "ability": "multi_turn_tool_calling",
+            "question": "2억 4천만 원을 연 4.1% 금리로 계산했을 때 월 이자만 얼마인지 계산해줘."
+        }
+    },
+    {
+        "id": "paper_search_then_summary",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "2025년 SIGIR의 conversational recommender systems 관련 논문을 검색하고 핵심만 짧게 말해줘."}
+        ],
+        "ground_truth": {
+            "final_answer_must_contain": ["SIGIR", "conversational recommender systems"],
+            "expected_tools": ["search_papers"],
+            "must_end_with_final": True
+        },
+        "extra_info": {
+            "split": "val",
+            "ability": "retrieval_tool_calling",
+            "question": "2025년 SIGIR의 conversational recommender systems 관련 논문을 검색하고 핵심만 짧게 말해줘."
+        }
+    },
+]
+
+
+def to_verl_row(sample: Dict[str, Any], data_source: str) -> Dict[str, Any]:
+    return {
+        "data_source": data_source,
+        "prompt": sample["messages"],
+        "ability": sample["extra_info"]["ability"],
+        "reward_model": {
+            "style": "rule",
+            "ground_truth": json.dumps(sample["ground_truth"], ensure_ascii=False)
+        },
+        "extra_info": {
+            **sample["extra_info"],
+            "sample_id": sample["id"]
+        }
+    }
+
+
+def main() -> None:
+    os.makedirs("data", exist_ok=True)
+
+    train_rows = []
+    val_rows = []
+    data_source = "custom/multiturn_tool_grpo"
+
+    for sample in SAMPLES:
+        row = to_verl_row(sample, data_source=data_source)
+        if sample["extra_info"]["split"] == "train":
+            train_rows.append(row)
+        else:
+            val_rows.append(row)
+
+    train_df = pd.DataFrame(train_rows)
+    val_df = pd.DataFrame(val_rows)
+
+    train_path = os.path.join("data", "train.parquet")
+    val_path = os.path.join("data", "val.parquet")
+
+    train_df.to_parquet(train_path, index=False)
+    val_df.to_parquet(val_path, index=False)
+
+    print(f"Saved train parquet to: {train_path}")
+    print(f"Saved val parquet to:   {val_path}")
+    print(f"Train size: {len(train_df)}")
+    print(f"Val size:   {len(val_df)}")
+
+
+if __name__ == "__main__":
+    main()
+
+--------------------------------------------------------------------------------
+FILE: reward/custom_reward.py
+--------------------------------------------------------------------------------
+import json
+import re
+from typing import Any, Dict, List
+
+
+def _safe_load_json(text: str) -> Dict[str, Any]:
+    try:
+        return json.loads(text)
+    except Exception:
+        return {}
+
+
+def _extract_final_answer(solution_str: str) -> str:
+    if not solution_str:
+        return ""
+    matches = re.findall(r"FINAL:\s*(.*)", solution_str, flags=re.IGNORECASE)
+    return matches[-1].strip() if matches else ""
+
+
+def _extract_tool_names(solution_str: str) -> List[str]:
+    names = []
+    for pattern in [
+        r'"name"\s*:\s*"([^"]+)"',
+        r'"tool_name"\s*:\s*"([^"]+)"',
+        r'<tool_call>.*?([A-Za-z_][A-Za-z0-9_]*)\s*</tool_call>',
+    ]:
+        found = re.findall(pattern, solution_str, flags=re.DOTALL)
+        names.extend(found)
+    return names
+
+
+def _contains_all_needles(text: str, needles: List[str]) -> bool:
+    lower_text = text.lower()
+    return all(needle.lower() in lower_text for needle in needles)
+
+
+def compute_score(
+    data_source: str,
+    solution_str: str,
+    ground_truth: str,
+    extra_info: Dict[str, Any] = None,
+):
+    gt = _safe_load_json(ground_truth)
+    extra_info = extra_info or {}
+
+    reward = 0.0
+
+    final_answer = _extract_final_answer(solution_str)
+    must_end_with_final = bool(gt.get("must_end_with_final", False))
+    if must_end_with_final:
+        if final_answer:
+            reward += 0.2
+        else:
+            reward -= 0.2
+
+    must_contain = gt.get("final_answer_must_contain", [])
+    if must_contain:
+        if _contains_all_needles(final_answer or solution_str, must_contain):
+            reward += 1.0
+        else:
+            reward -= 0.5
+
+    expected_tools = gt.get("expected_tools", [])
+    observed_tools = _extract_tool_names(solution_str)
+
+    if expected_tools:
+        coverage = 0
+        used = list(observed_tools)
+        for tool_name in expected_tools:
+            if tool_name in used:
+                coverage += 1
+                used.remove(tool_name)
+        reward += 0.3 * (coverage / max(1, len(expected_tools)))
+        extra_count = max(0, len(observed_tools) - len(expected_tools))
+        reward -= 0.05 * extra_count
+
+    if expected_tools and len(observed_tools) == 0:
+        reward -= 0.2
+
+    token_like_len = len(solution_str.split())
+    if token_like_len > 512:
+        reward -= 0.1
+
+    return reward
+
+--------------------------------------------------------------------------------
+FILE: tools/simple_tools.py
+--------------------------------------------------------------------------------
+import ast
+import json
+from typing import Any, Dict, Tuple
+
+from verl.tools.base_tool import BaseTool
+
+
+class GetWeatherTool(BaseTool):
+    def __init__(self, **config):
+        super().__init__()
+        self.config = config
+
+    async def execute(self, request: Dict[str, Any], **kwargs) -> Tuple[str, float, dict]:
+        location = request.get("location", "")
+        date = request.get("date", "")
+        db = {
+            ("서울", "2026-03-26"): {"weather": "맑음", "temp_c": 16},
+            ("부산", "2026-03-26"): {"weather": "흐림", "temp_c": 14},
+        }
+        result = db.get((location, date), {"weather": "알 수 없음", "temp_c": None})
+        text = json.dumps(
+            {
+                "location": location,
+                "date": date,
+                "weather": result["weather"],
+                "temp_c": result["temp_c"],
+            },
+            ensure_ascii=False,
+        )
+        return text, 0.0, {}
+
+
+class CalculateExpressionTool(BaseTool):
+    def __init__(self, **config):
+        super().__init__()
+        self.config = config
+
+    def _safe_eval(self, expr: str) -> float:
+        allowed_nodes = (
+            ast.Expression,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.Num,
+            ast.Constant,
+            ast.Add,
+            ast.Sub,
+            ast.Mult,
+            ast.Div,
+            ast.Pow,
+            ast.USub,
+            ast.UAdd,
+            ast.Mod,
+            ast.FloorDiv,
+            ast.Load,
+            ast.Call,
+            ast.Name,
+        )
+        tree = ast.parse(expr, mode="eval")
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed_nodes):
+                raise ValueError(f"Unsupported AST node: {type(node).__name__}")
+            if isinstance(node, (ast.Call, ast.Name)):
+                raise ValueError("Function calls and variable names are not allowed.")
+        return eval(compile(tree, "<expr>", "eval"), {"__builtins__": {}}, {})
+
+    async def execute(self, request: Dict[str, Any], **kwargs) -> Tuple[str, float, dict]:
+        expr = request.get("expression", "")
+        value = self._safe_eval(expr)
+        return str(value), 0.0, {}
+
+
+class SearchPapersTool(BaseTool):
+    def __init__(self, **config):
+        super().__init__()
+        self.config = config
+
+    async def execute(self, request: Dict[str, Any], **kwargs) -> Tuple[str, float, dict]:
+        query = request.get("query", "")
+        venue = request.get("venue", "")
+        year = request.get("year", None)
+        mock_results = [
+            {
+                "title": "A Survey of Conversational Recommender Systems",
+                "venue": venue or "SIGIR",
+                "year": year or 2025,
+                "summary": f"Mock result for query={query}",
+            }
+        ]
+        return json.dumps(mock_results, ensure_ascii=False), 0.0, {}
+
+--------------------------------------------------------------------------------
+FILE: tools/tools.yaml
+--------------------------------------------------------------------------------
+tools:
+  - class_name: "tools.simple_tools.GetWeatherTool"
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: get_weather
+        description: Get weather information for a city and date.
+        parameters:
+          type: object
+          properties:
+            location:
+              type: string
+            date:
+              type: string
+          required: ["location", "date"]
+          additionalProperties: false
+
+  - class_name: "tools.simple_tools.CalculateExpressionTool"
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: calculate_expression
+        description: Evaluate an arithmetic expression.
+        parameters:
+          type: object
+          properties:
+            expression:
+              type: string
+          required: ["expression"]
+          additionalProperties: false
+
+  - class_name: "tools.simple_tools.SearchPapersTool"
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: search_papers
+        description: Search papers by query, optional venue, and optional year.
+        parameters:
+          type: object
+          properties:
+            query:
+              type: string
+            venue:
+              type: string
+            year:
+              type: integer
+          required: ["query"]
+          additionalProperties: false
+
+--------------------------------------------------------------------------------
+FILE: train_grpo_multiturn.sh
+--------------------------------------------------------------------------------
+#!/usr/bin/env bash
+set -euxo pipefail
+
+MODEL_PATH="${1:-Qwen/Qwen2.5-7B-Instruct}"
+
+python data/prepare_multiturn_dataset.py
+
+python3 -m verl.trainer.main_ppo \
+  algorithm.adv_estimator=grpo \
+  data.train_files=data/train.parquet \
+  data.val_files=data/val.parquet \
+  data.train_batch_size=64 \
+  data.val_batch_size=64 \
+  data.max_prompt_length=1024 \
+  data.max_response_length=1024 \
+  data.filter_overlong_prompts=True \
+  data.truncation=error \
+  actor_rollout_ref.model.path="${MODEL_PATH}" \
+  actor_rollout_ref.actor.optim.lr=1e-6 \
+  actor_rollout_ref.model.use_remove_padding=True \
+  actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+  actor_rollout_ref.actor.use_kl_loss=True \
+  actor_rollout_ref.actor.kl_loss_coef=0.001 \
+  actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+  actor_rollout_ref.actor.entropy_coeff=0 \
+  actor_rollout_ref.model.enable_gradient_checkpointing=True \
+  actor_rollout_ref.rollout.name=sglang \
+  actor_rollout_ref.rollout.multi_turn=True \
+  actor_rollout_ref.rollout.tool_kwargs.tools_config_file=tools/tools.yaml \
+  actor_rollout_ref.rollout.n=4 \
+  actor_rollout_ref.rollout.temperature=0.8 \
+  actor_rollout_ref.rollout.top_p=0.95 \
+  reward.reward_manager=naive \
+  reward.custom_reward_function.path=reward/custom_reward.py \
+  reward.custom_reward_function.name=compute_score \
+  trainer.project_name=verl-grpo-multiturn-demo \
+  trainer.experiment_name=grpo_tool_calling_multiturn \
+  trainer.logger='["console"]' \
+  trainer.n_gpus_per_node=4 \
+  trainer.nnodes=1 \
+  trainer.total_epochs=1 \
+  trainer.test_freq=10 \
+  trainer.save_freq=10
+
+--------------------------------------------------------------------------------
+FILE: OPTIONAL_NOTES.txt
+--------------------------------------------------------------------------------
+1. Start from an SFT model that already knows the tool-calling format.
+
+2. Multi-turn here means the rollout engine can repeat:
+   - model generates tool call
+   - tool executes
+   - tool result is appended
+   - model continues generation
+
+3. The first three files you will usually customize:
+   - tools/simple_tools.py
+   - reward/custom_reward.py
+   - SYSTEM_PROMPT in prepare_multiturn_dataset.py
+
+4. If the model outputs malformed tool calls, improve the SFT stage first.
+
+5. If reward is too sparse, add dense terms for:
+   - valid FINAL line
+   - partial tool coverage
+   - exact answer
+   - non-rambling answer length
