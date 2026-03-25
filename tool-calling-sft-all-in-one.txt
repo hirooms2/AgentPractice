@@ -1,0 +1,135 @@
+===== FILE: data/train.jsonl =====
+{"messages":[{"role":"system","content":"You are a helpful assistant. Use tools when needed."},{"role":"user","content":"내일 서울 날씨 알려줘"},{"role":"assistant","content":null,"tool_calls":[{"id":"call1","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"서울\",\"date\":\"2026-03-26\"}"}}]}]}
+{"messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"function calling이 뭐야?"},{"role":"assistant","content":"Function calling은 LLM이 외부 도구를 사용하기 위해 구조화된 출력을 생성하는 방식입니다."}]}
+{"messages":[{"role":"system","content":"Use tools for calculations."},{"role":"user","content":"2+3 계산해줘"},{"role":"assistant","content":null,"tool_calls":[{"id":"call2","type":"function","function":{"name":"calculate_expression","arguments":"{\"expression\":\"2+3\"}"}}]},{"role":"tool","tool_call_id":"call2","name":"calculate_expression","content":"5"},{"role":"assistant","content":"결과는 5입니다."}]}
+
+===== FILE: src/train.py =====
+import json
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from trl import SFTTrainer, SFTConfig
+
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+
+def build_tools():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "date": {"type": "string"}
+                    },
+                    "required": ["location","date"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "calculate_expression",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": {"type": "string"}
+                    },
+                    "required": ["expression"]
+                }
+            }
+        }
+    ]
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+
+dataset = load_dataset("json", data_files="../data/train.jsonl")["train"]
+
+def format_example(example):
+    return {
+        "text": tokenizer.apply_chat_template(
+            example["messages"],
+            tools=build_tools(),
+            tokenize=False,
+            add_generation_prompt=False
+        )
+    }
+
+dataset = dataset.map(format_example, remove_columns=dataset.column_names)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    trust_remote_code=True,
+    device_map="auto"
+)
+
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    args=SFTConfig(
+        output_dir="../model",
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=4,
+        learning_rate=2e-5,
+        num_train_epochs=3,
+        logging_steps=1,
+        bf16=True
+    ),
+)
+
+trainer.train()
+trainer.save_model("../model")
+
+===== FILE: inference.py =====
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+MODEL_PATH = "./model"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_PATH,
+    trust_remote_code=True,
+    device_map="auto"
+)
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type":"string"},
+                    "date": {"type":"string"}
+                },
+                "required": ["location","date"]
+            }
+        }
+    }
+]
+
+messages = [
+    {"role":"system","content":"Use tools when needed."},
+    {"role":"user","content":"내일 서울 날씨 알려줘"}
+]
+
+prompt = tokenizer.apply_chat_template(
+    messages,
+    tools=tools,
+    tokenize=False,
+    add_generation_prompt=True
+)
+
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+outputs = model.generate(**inputs, max_new_tokens=200)
+
+print(tokenizer.decode(outputs[0], skip_special_tokens=False))
+
+===== FILE: requirements.txt =====
+transformers
+datasets
+trl
+accelerate
